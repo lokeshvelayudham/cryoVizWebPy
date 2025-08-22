@@ -53,6 +53,115 @@ async def post_status(session: aiohttp.ClientSession, upload_id: str, user_id: s
         if resp.status >= 300:
             logger.warning("Status post failed %s: %s", resp.status, text)
 
+async def download_from_azure_url(azure_url: str, local_path: str):
+    """Download file from Azure blob URL to local path"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(azure_url) as response:
+                if response.status == 200:
+                    with open(local_path, "wb") as f:
+                        f.write(await response.read())
+                    logger.info(f"Downloaded {azure_url} to {local_path}")
+                else:
+                    raise Exception(f"Failed to download from Azure: {response.status}")
+    except Exception as e:
+        logger.error(f"Error downloading from Azure: {e}")
+        raise
+
+async def process_tiff_from_azure(azure_url: str, filename: Optional[str], alpha_file_path: Optional[str], dataset_id: str, modality: str) -> Tuple[Optional[str], Optional[int], Optional[int], Optional[int]]:
+    """Process TIFF file downloaded from Azure URL"""
+    temp_dir = "./temp"
+    os.makedirs(temp_dir, exist_ok=True)
+    temp_tiff_path = os.path.join(temp_dir, filename or f"{modality}_{dataset_id}.tiff")
+
+    try:
+        # Download from Azure
+        await download_from_azure_url(azure_url, temp_tiff_path)
+        
+        # Process the downloaded file
+        return await process_tiff_stack_from_file(temp_tiff_path, alpha_file_path, dataset_id, modality)
+    finally:
+        if os.path.exists(temp_tiff_path):
+            os.remove(temp_tiff_path)
+
+async def process_tiff_stack_from_file(tiff_path: str, alpha_file_path: Optional[str], dataset_id: str, modality: str) -> Tuple[Optional[str], Optional[int], Optional[int], Optional[int]]:
+    """Process TIFF file from local path (existing logic)"""
+    try:
+        logger.info("Reading %s TIFF: %s", modality, tiff_path)
+        rgba_stack = io.imread(tiff_path)
+        if rgba_stack.ndim != 4 or rgba_stack.shape[-1] != 4:
+            raise HTTPException(status_code=400, detail=f"Invalid TIFF format for {modality}: must be RGBA with shape (Z, Y, X, 4)")
+
+        Z, Y, X, _ = rgba_stack.shape
+        logger.info("%s dimensions: Z=%d, Y=%d, X=%d", modality, Z, Y, X)
+
+        alpha_stack = None
+        if alpha_file_path and os.path.exists(alpha_file_path):
+            alpha_stack = io.imread(alpha_file_path)
+            if alpha_stack.shape != (Z, Y, X):
+                raise HTTPException(status_code=400, detail=f"Alpha mask dimensions {alpha_stack.shape} do not match {modality} stack {rgba_stack.shape}")
+
+        alpha_threshold = 10
+
+        def apply_alpha_mask(rgba, alpha_mask=None):
+            rgba = rgba.copy()
+            if alpha_mask is not None:
+                mask = alpha_mask < alpha_threshold
+                rgba[mask] = [0, 0, 0, 0]
+            return rgba
+
+        container_client = blob_service_client.get_container_client(container_name)
+        blob_prefix = f"dataset-{dataset_id}/{modality}"
+
+        # Save XY slices
+        for z in range(Z):
+            if CANCEL_FLAGS.get(dataset_id) or CANCEL_FLAGS.get(modality) or CANCEL_FLAGS.get("__" + dataset_id):
+                raise Exception("Cancelled")
+            rgba_slice = rgba_stack[z]
+            alpha_mask = alpha_stack[z] if alpha_stack is not None else None
+            img = Image.fromarray(apply_alpha_mask(rgba_slice, alpha_mask))
+            img_byte_arr = BytesIO()
+            img.save(img_byte_arr, format="PNG")
+            img_byte_arr.seek(0)
+            blob_name = f"{blob_prefix}/xy/{z:03d}.png"
+            blob_client = container_client.get_blob_client(blob_name)
+            blob_client.upload_blob(img_byte_arr.read(), overwrite=True)
+
+        # Save XZ slices
+        for y in range(Y):
+            if CANCEL_FLAGS.get(dataset_id) or CANCEL_FLAGS.get(modality) or CANCEL_FLAGS.get("__" + dataset_id):
+                raise Exception("Cancelled")
+            rgba_xz = np.stack([rgba_stack[z, y, :, :] for z in range(Z)], axis=0)
+            alpha_xz = np.stack([alpha_stack[z, y, :] for z in range(Z)], axis=0) if alpha_stack is not None else None
+            img = Image.fromarray(apply_alpha_mask(rgba_xz, alpha_xz))
+            img_byte_arr = BytesIO()
+            img.save(img_byte_arr, format="PNG")
+            img_byte_arr.seek(0)
+            blob_name = f"{blob_prefix}/xz/{y:03d}.png"
+            blob_client = container_client.get_blob_client(blob_name)
+            blob_client.upload_blob(img_byte_arr.read(), overwrite=True)
+
+        # Save YZ slices
+        for x in range(X):
+            if CANCEL_FLAGS.get(dataset_id) or CANCEL_FLAGS.get(modality) or CANCEL_FLAGS.get("__" + dataset_id):
+                raise Exception("Cancelled")
+            rgba_yz = np.stack([rgba_stack[z, :, x, :] for z in range(Z)], axis=0)
+            alpha_yz = np.stack([alpha_stack[z, :, x] for z in range(Z)], axis=0) if alpha_stack is not None else None
+            img = Image.fromarray(apply_alpha_mask(rgba_yz, alpha_yz))
+            img_byte_arr = BytesIO()
+            img.save(img_byte_arr, format="PNG")
+            img_byte_arr.seek(0)
+            blob_name = f"{blob_prefix}/yz/{x:03d}.png"
+            blob_client = container_client.get_blob_client(blob_name)
+            blob_client.upload_blob(img_byte_arr.read(), overwrite=True)
+
+        blob_url = f"https://{storage_account_name}.blob.core.windows.net/{container_name}/{blob_prefix}"
+        return blob_url, Z, Y, X
+
+    except Exception as e:
+        logger.error(f"Error processing TIFF file: {e}")
+        raise
+
 
 async def process_tiff_stack(tiff_bytes: Optional[bytes], filename: Optional[str], alpha_file_path: Optional[str], dataset_id: str, modality: str) -> Tuple[Optional[str], Optional[int], Optional[int], Optional[int]]:
     if not tiff_bytes:
@@ -149,11 +258,11 @@ async def process_dataset_bg(
     description: str,
     institution_id: str,
     spacing: str,
-    bf_bytes: Optional[bytes],
+    bf_temp_url: Optional[str],
     bf_filename: Optional[str],
-    fl_bytes: Optional[bytes],
+    fl_temp_url: Optional[str],
     fl_filename: Optional[str],
-    alpha_bytes: Optional[bytes],
+    alpha_temp_url: Optional[str],
 ):
     dataset_id = str(uuid.uuid4())
     alpha_temp_path = None
@@ -166,34 +275,34 @@ async def process_dataset_bg(
                 "message": "Starting processing..."
             })
 
-            # Save alpha to temp if provided
-            if alpha_bytes:
+            # Download alpha from Azure if provided
+            alpha_temp_path = None
+            if alpha_temp_url:
                 temp_dir = "./temp"
                 os.makedirs(temp_dir, exist_ok=True)
                 alpha_temp_path = os.path.join(temp_dir, f"alpha_{dataset_id}.tiff")
-                with open(alpha_temp_path, "wb") as f:
-                    f.write(alpha_bytes)
+                await download_from_azure_url(alpha_temp_url, alpha_temp_path)
 
             brightfield_blob_url = None
             fluorescent_blob_url = None
             bfZ = bfY = bfX = None
             flZ = flY = flX = None
 
-            if bf_bytes:
+            if bf_temp_url:
                 await post_status(session, upload_id, user_id, {
                     "status": "processing",
                     "progress": 40,
                     "message": "Processing brightfield..."
                 })
-                brightfield_blob_url, bfZ, bfY, bfX = await process_tiff_stack(bf_bytes, bf_filename, alpha_temp_path, dataset_id, "brightfield")
+                brightfield_blob_url, bfZ, bfY, bfX = await process_tiff_from_azure(bf_temp_url, bf_filename, alpha_temp_path, dataset_id, "brightfield")
 
-            if fl_bytes:
+            if fl_temp_url:
                 await post_status(session, upload_id, user_id, {
                     "status": "processing",
                     "progress": 60,
                     "message": "Processing fluorescent..."
                 })
-                fluorescent_blob_url, flZ, flY, flX = await process_tiff_stack(fl_bytes, fl_filename, alpha_temp_path, dataset_id, "fluorescent")
+                fluorescent_blob_url, flZ, flY, flX = await process_tiff_from_azure(fl_temp_url, fl_filename, alpha_temp_path, dataset_id, "fluorescent")
 
             # Save to DB via Next.js admin API
             await post_status(session, upload_id, user_id, {
@@ -255,9 +364,12 @@ async def process_dataset(
     name: str = Form(...),
     description: str = Form(default=""),
     institutionId: str = Form(...),
-    brightfield: Optional[UploadFile] = File(None),
-    fluorescent: Optional[UploadFile] = File(None),
-    alpha: Optional[UploadFile] = File(None),
+    brightfieldTempUrl: Optional[str] = Form(default=None),
+    fluorescentTempUrl: Optional[str] = Form(default=None),
+    alphaTempUrl: Optional[str] = Form(default=None),
+    brightfieldFilename: Optional[str] = Form(default=None),
+    fluorescentFilename: Optional[str] = Form(default=None),
+    alphaFilename: Optional[str] = Form(default=None),
     spacing: str = Form(default=""),
     uploadId: str = Form(...),
     userId: str = Form(...),
@@ -267,17 +379,12 @@ async def process_dataset(
     if nextBaseUrl:
         NEXT_BASE_URL = nextBaseUrl
 
-    # Read file bytes before we return (UploadFile may be closed afterwards)
-    bf_bytes = await brightfield.read() if brightfield else None
-    fl_bytes = await fluorescent.read() if fluorescent else None
-    alpha_bytes = await alpha.read() if alpha else None
-
     # Schedule background coroutine on current event loop and return immediately
     asyncio.create_task(
         process_dataset_bg(uploadId, userId, name, description, institutionId, spacing,
-                           bf_bytes, brightfield.filename if brightfield else None,
-                           fl_bytes, fluorescent.filename if fluorescent else None,
-                           alpha_bytes)
+                           brightfieldTempUrl, brightfieldFilename,
+                           fluorescentTempUrl, fluorescentFilename,
+                           alphaTempUrl)
     )
 
     return {"accepted": True, "uploadId": uploadId}
