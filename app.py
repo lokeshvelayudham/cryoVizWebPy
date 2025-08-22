@@ -39,7 +39,7 @@ storage_account_name = os.getenv("AZURE_STORAGE_ACCOUNT", "bivlargefiles")
 container_name = os.getenv("AZURE_CONTAINER", "cryovizweb")
 
 INTERNAL_API_SECRET = os.getenv("INTERNAL_API_SECRET")
-NEXT_BASE_URL = os.getenv("NEXT_BASE_URL", "http://localhost:3000")
+NEXT_BASE_URL = os.getenv("NEXT_BASE_URL", "https://cryo-viz-web.vercel.app")
 
 # In-memory cancellation flags keyed by uploadId
 CANCEL_FLAGS: dict[str, bool] = {}
