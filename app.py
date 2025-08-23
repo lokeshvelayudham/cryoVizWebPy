@@ -110,13 +110,20 @@ async def process_tiff_stack_from_file(tiff_path: str, alpha_file_path: Optional
                 rgba[mask] = [0, 0, 0, 0]
             return rgba
 
+        # START PNG GENERATION - process_tiff_stack_from_file function
         container_client = blob_service_client.get_container_client(container_name)
         blob_prefix = f"dataset-{dataset_id}/{modality}"
+
+        logger.info("Starting PNG generation for %s - XY slices (%d), XZ slices (%d), YZ slices (%d)", modality, Z, Y, X)
 
         # Save XY slices
         for z in range(Z):
             if CANCEL_FLAGS.get(dataset_id) or CANCEL_FLAGS.get(modality) or CANCEL_FLAGS.get("__" + dataset_id):
                 raise Exception("Cancelled")
+            
+            if z % 10 == 0:  # Log progress every 10 slices
+                logger.info("Processing %s XY slice %d/%d", modality, z + 1, Z)
+                
             rgba_slice = rgba_stack[z]
             alpha_mask = alpha_stack[z] if alpha_stack is not None else None
             img = Image.fromarray(apply_alpha_mask(rgba_slice, alpha_mask))
@@ -127,10 +134,16 @@ async def process_tiff_stack_from_file(tiff_path: str, alpha_file_path: Optional
             blob_client = container_client.get_blob_client(blob_name)
             blob_client.upload_blob(img_byte_arr.read(), overwrite=True)
 
+        logger.info("Completed XY slices for %s", modality)
+
         # Save XZ slices
         for y in range(Y):
             if CANCEL_FLAGS.get(dataset_id) or CANCEL_FLAGS.get(modality) or CANCEL_FLAGS.get("__" + dataset_id):
                 raise Exception("Cancelled")
+                
+            if y % 50 == 0:  # Log progress every 50 slices
+                logger.info("Processing %s XZ slice %d/%d", modality, y + 1, Y)
+                
             rgba_xz = np.stack([rgba_stack[z, y, :, :] for z in range(Z)], axis=0)
             alpha_xz = np.stack([alpha_stack[z, y, :] for z in range(Z)], axis=0) if alpha_stack is not None else None
             img = Image.fromarray(apply_alpha_mask(rgba_xz, alpha_xz))
@@ -141,10 +154,16 @@ async def process_tiff_stack_from_file(tiff_path: str, alpha_file_path: Optional
             blob_client = container_client.get_blob_client(blob_name)
             blob_client.upload_blob(img_byte_arr.read(), overwrite=True)
 
+        logger.info("Completed XZ slices for %s", modality)
+
         # Save YZ slices
         for x in range(X):
             if CANCEL_FLAGS.get(dataset_id) or CANCEL_FLAGS.get(modality) or CANCEL_FLAGS.get("__" + dataset_id):
                 raise Exception("Cancelled")
+                
+            if x % 100 == 0:  # Log progress every 100 slices
+                logger.info("Processing %s YZ slice %d/%d", modality, x + 1, X)
+                
             rgba_yz = np.stack([rgba_stack[z, :, x, :] for z in range(Z)], axis=0)
             alpha_yz = np.stack([alpha_stack[z, :, x] for z in range(Z)], axis=0) if alpha_stack is not None else None
             img = Image.fromarray(apply_alpha_mask(rgba_yz, alpha_yz))
@@ -155,100 +174,15 @@ async def process_tiff_stack_from_file(tiff_path: str, alpha_file_path: Optional
             blob_client = container_client.get_blob_client(blob_name)
             blob_client.upload_blob(img_byte_arr.read(), overwrite=True)
 
+        logger.info("Completed YZ slices for %s", modality)
+
         blob_url = f"https://{storage_account_name}.blob.core.windows.net/{container_name}/{blob_prefix}"
+        logger.info("Successfully processed %s - generated %d PNG files", modality, Z + Y + X)
         return blob_url, Z, Y, X
 
     except Exception as e:
         logger.error(f"Error processing TIFF file: {e}")
         raise
-
-
-async def process_tiff_stack(tiff_bytes: Optional[bytes], filename: Optional[str], alpha_file_path: Optional[str], dataset_id: str, modality: str) -> Tuple[Optional[str], Optional[int], Optional[int], Optional[int]]:
-    if not tiff_bytes:
-        return None, None, None, None
-
-    temp_dir = "./temp"
-    os.makedirs(temp_dir, exist_ok=True)
-    temp_tiff_path = os.path.join(temp_dir, filename or f"{modality}_{dataset_id}.tiff")
-
-    try:
-        with open(temp_tiff_path, "wb") as f:
-            f.write(tiff_bytes)
-
-        logger.info("Reading %s TIFF: %s", modality, temp_tiff_path)
-        rgba_stack = io.imread(temp_tiff_path)
-        if rgba_stack.ndim != 4 or rgba_stack.shape[-1] != 4:
-            raise HTTPException(status_code=400, detail=f"Invalid TIFF format for {modality}: must be RGBA with shape (Z, Y, X, 4)")
-
-        Z, Y, X, _ = rgba_stack.shape
-        logger.info("%s dimensions: Z=%d, Y=%d, X=%d", modality, Z, Y, X)
-
-        alpha_stack = None
-        if alpha_file_path and os.path.exists(alpha_file_path):
-            alpha_stack = io.imread(alpha_file_path)
-            if alpha_stack.shape != (Z, Y, X):
-                raise HTTPException(status_code=400, detail=f"Alpha mask dimensions {alpha_stack.shape} do not match {modality} stack {rgba_stack.shape}")
-
-        alpha_threshold = 10
-
-        def apply_alpha_mask(rgba, alpha_mask=None):
-            rgba = rgba.copy()
-            if alpha_mask is not None:
-                mask = alpha_mask < alpha_threshold
-                rgba[mask] = [0, 0, 0, 0]
-            return rgba
-
-        container_client = blob_service_client.get_container_client(container_name)
-        blob_prefix = f"dataset-{dataset_id}/{modality}"
-
-        # Save XY slices
-        for z in range(Z):
-            if CANCEL_FLAGS.get(dataset_id) or CANCEL_FLAGS.get(modality) or CANCEL_FLAGS.get("__" + dataset_id):
-                raise Exception("Cancelled")
-            rgba_slice = rgba_stack[z]
-            alpha_mask = alpha_stack[z] if alpha_stack is not None else None
-            img = Image.fromarray(apply_alpha_mask(rgba_slice, alpha_mask))
-            img_byte_arr = BytesIO()
-            img.save(img_byte_arr, format="PNG")
-            img_byte_arr.seek(0)
-            blob_name = f"{blob_prefix}/xy/{z:03d}.png"
-            blob_client = container_client.get_blob_client(blob_name)
-            blob_client.upload_blob(img_byte_arr.read(), overwrite=True)
-
-        # Save XZ slices
-        for y in range(Y):
-            if CANCEL_FLAGS.get(dataset_id) or CANCEL_FLAGS.get(modality) or CANCEL_FLAGS.get("__" + dataset_id):
-                raise Exception("Cancelled")
-            rgba_xz = np.stack([rgba_stack[z, y, :, :] for z in range(Z)], axis=0)
-            alpha_xz = np.stack([alpha_stack[z, y, :] for z in range(Z)], axis=0) if alpha_stack is not None else None
-            img = Image.fromarray(apply_alpha_mask(rgba_xz, alpha_xz))
-            img_byte_arr = BytesIO()
-            img.save(img_byte_arr, format="PNG")
-            img_byte_arr.seek(0)
-            blob_name = f"{blob_prefix}/xz/{y:03d}.png"
-            blob_client = container_client.get_blob_client(blob_name)
-            blob_client.upload_blob(img_byte_arr.read(), overwrite=True)
-
-        # Save YZ slices
-        for x in range(X):
-            if CANCEL_FLAGS.get(dataset_id) or CANCEL_FLAGS.get(modality) or CANCEL_FLAGS.get("__" + dataset_id):
-                raise Exception("Cancelled")
-            rgba_yz = np.stack([rgba_stack[z, :, x, :] for z in range(Z)], axis=0)
-            alpha_yz = np.stack([alpha_stack[z, :, x] for z in range(Z)], axis=0) if alpha_stack is not None else None
-            img = Image.fromarray(apply_alpha_mask(rgba_yz, alpha_yz))
-            img_byte_arr = BytesIO()
-            img.save(img_byte_arr, format="PNG")
-            img_byte_arr.seek(0)
-            blob_name = f"{blob_prefix}/yz/{x:03d}.png"
-            blob_client = container_client.get_blob_client(blob_name)
-            blob_client.upload_blob(img_byte_arr.read(), overwrite=True)
-
-        blob_url = f"https://{storage_account_name}.blob.core.windows.net/{container_name}/{blob_prefix}"
-        return blob_url, Z, Y, X
-
-    finally:
-        if os.path.exists(temp_tiff_path):
-            os.remove(temp_tiff_path)
 
 
 async def process_dataset_bg(
