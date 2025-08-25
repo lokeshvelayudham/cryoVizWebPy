@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["http://localhost:3000", "https://cryo-viz-web.vercel.app", "https://cryo-viz-web.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"]
@@ -338,6 +338,9 @@ async def cancel_upload(request: Request, x_internal_secret: Optional[str] = Hea
     CANCEL_FLAGS[upload_id] = True
     return {"ok": True}
 
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "message": "Python processor is running"}
 
 if __name__ == "__main__":
     import uvicorn
