@@ -12,6 +12,9 @@ from dotenv import load_dotenv
 from io import BytesIO
 import asyncio
 import aiohttp
+import redis.asyncio as redis
+from azure.storage.blob.aio import BlobServiceClient
+from concurrent.futures import ThreadPoolExecutor
 
 # Load environment variables
 load_dotenv()
@@ -24,7 +27,11 @@ logger = logging.getLogger(__name__)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "https://cryo-viz-web.vercel.app", "https://cryo-viz-web.vercel.app"],
+    allow_origins=[
+        "http://localhost:3000", 
+        "https://cryo-viz-web.vercel.app", 
+        "https://jolly-sky-05d96830f.6.azurestaticapps.net"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"]
@@ -39,10 +46,31 @@ storage_account_name = os.getenv("AZURE_STORAGE_ACCOUNT", "bivlargefiles")
 container_name = os.getenv("AZURE_CONTAINER", "cryovizweb")
 
 INTERNAL_API_SECRET = os.getenv("INTERNAL_API_SECRET")
-NEXT_BASE_URL = os.getenv("NEXT_BASE_URL", "https://cryo-viz-web.vercel.app")
+NEXT_BASE_URL = os.getenv("NEXT_BASE_URL", "https://jolly-sky-05d96830f.6.azurestaticapps.net")
 
-# In-memory cancellation flags keyed by uploadId
-CANCEL_FLAGS: dict[str, bool] = {}
+# Redis Client for cancellation flags
+redis_client = None
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+
+@app.on_event("startup")
+async def startup_event():
+    global redis_client
+    redis_client = redis.from_url(REDIS_URL)
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    if redis_client:
+        await redis_client.close()
+
+async def is_cancelled(dataset_id: str, modality: str) -> bool:
+    if not redis_client:
+        return False
+    # Check flags for dataset, modality, or global dataset
+    keys = [f"cancel:{dataset_id}", f"cancel:{modality}", f"cancel:__{dataset_id}"]
+    for key in keys:
+        if await redis_client.exists(key):
+            return True
+    return False
 
 async def post_status(session: aiohttp.ClientSession, upload_id: str, user_id: str, payload: dict):
     url = f"{NEXT_BASE_URL}/api/upload-status"
@@ -88,7 +116,8 @@ async def process_tiff_stack_from_file(tiff_path: str, alpha_file_path: Optional
     """Process TIFF file from local path (existing logic)"""
     try:
         logger.info("Reading %s TIFF: %s", modality, tiff_path)
-        rgba_stack = io.imread(tiff_path)
+        # Offload file reading to thread
+        rgba_stack = await asyncio.to_thread(io.imread, tiff_path)
         if rgba_stack.ndim != 4 or rgba_stack.shape[-1] != 4:
             raise HTTPException(status_code=400, detail=f"Invalid TIFF format for {modality}: must be RGBA with shape (Z, Y, X, 4)")
 
@@ -97,7 +126,7 @@ async def process_tiff_stack_from_file(tiff_path: str, alpha_file_path: Optional
 
         alpha_stack = None
         if alpha_file_path and os.path.exists(alpha_file_path):
-            alpha_stack = io.imread(alpha_file_path)
+            alpha_stack = await asyncio.to_thread(io.imread, alpha_file_path)
             if alpha_stack.shape != (Z, Y, X):
                 raise HTTPException(status_code=400, detail=f"Alpha mask dimensions {alpha_stack.shape} do not match {modality} stack {rgba_stack.shape}")
 
@@ -110,69 +139,99 @@ async def process_tiff_stack_from_file(tiff_path: str, alpha_file_path: Optional
                 rgba[mask] = [0, 0, 0, 0]
             return rgba
 
-        # START PNG GENERATION - process_tiff_stack_from_file function
+        def generate_png_bytes(slice_array, alpha_mask_array):
+            img = Image.fromarray(apply_alpha_mask(slice_array, alpha_mask_array))
+            img_byte_arr = BytesIO()
+            img.save(img_byte_arr, format="PNG")
+            img_byte_arr.seek(0)
+            return img_byte_arr.read()
+
         container_client = blob_service_client.get_container_client(container_name)
         blob_prefix = f"dataset-{dataset_id}/{modality}"
 
         logger.info("Starting PNG generation for %s - XY slices (%d), XZ slices (%d), YZ slices (%d)", modality, Z, Y, X)
+        
+        async def upload_batch(upload_tasks):
+            if upload_tasks:
+                await asyncio.gather(*upload_tasks)
+                upload_tasks.clear()
 
-        # Save XY slices
+        batch_size = 20
+        upload_tasks = []
+
+        # Process and Upload XY slices
         for z in range(Z):
-            if CANCEL_FLAGS.get(dataset_id) or CANCEL_FLAGS.get(modality) or CANCEL_FLAGS.get("__" + dataset_id):
+            if await is_cancelled(dataset_id, modality):
                 raise Exception("Cancelled")
             
-            if z % 10 == 0:  # Log progress every 10 slices
+            if z % 10 == 0:  
                 logger.info("Processing %s XY slice %d/%d", modality, z + 1, Z)
                 
             rgba_slice = rgba_stack[z]
             alpha_mask = alpha_stack[z] if alpha_stack is not None else None
-            img = Image.fromarray(apply_alpha_mask(rgba_slice, alpha_mask))
-            img_byte_arr = BytesIO()
-            img.save(img_byte_arr, format="PNG")
-            img_byte_arr.seek(0)
+            
+            # Generate PNG bytes in a thread to offload CPU
+            png_bytes = await asyncio.to_thread(generate_png_bytes, rgba_slice, alpha_mask)
+            
             blob_name = f"{blob_prefix}/xy/{z:03d}.png"
             blob_client = container_client.get_blob_client(blob_name)
-            blob_client.upload_blob(img_byte_arr.read(), overwrite=True)
+            upload_tasks.append(blob_client.upload_blob(png_bytes, overwrite=True))
+            
+            if len(upload_tasks) >= batch_size:
+                await upload_batch(upload_tasks)
+        await upload_batch(upload_tasks) # flush remaining
 
         logger.info("Completed XY slices for %s", modality)
 
-        # Save XZ slices
+        # Process and Upload XZ slices
+        def extract_xz_slice(y_idx):
+            rgba_xz = np.stack([rgba_stack[z, y_idx, :, :] for z in range(Z)], axis=0)
+            alpha_xz = np.stack([alpha_stack[z, y_idx, :] for z in range(Z)], axis=0) if alpha_stack is not None else None
+            return rgba_xz, alpha_xz
+            
         for y in range(Y):
-            if CANCEL_FLAGS.get(dataset_id) or CANCEL_FLAGS.get(modality) or CANCEL_FLAGS.get("__" + dataset_id):
+            if await is_cancelled(dataset_id, modality):
                 raise Exception("Cancelled")
                 
-            if y % 50 == 0:  # Log progress every 50 slices
+            if y % 50 == 0:
                 logger.info("Processing %s XZ slice %d/%d", modality, y + 1, Y)
                 
-            rgba_xz = np.stack([rgba_stack[z, y, :, :] for z in range(Z)], axis=0)
-            alpha_xz = np.stack([alpha_stack[z, y, :] for z in range(Z)], axis=0) if alpha_stack is not None else None
-            img = Image.fromarray(apply_alpha_mask(rgba_xz, alpha_xz))
-            img_byte_arr = BytesIO()
-            img.save(img_byte_arr, format="PNG")
-            img_byte_arr.seek(0)
+            rgba_xz, alpha_xz = await asyncio.to_thread(extract_xz_slice, y)
+            png_bytes = await asyncio.to_thread(generate_png_bytes, rgba_xz, alpha_xz)
+            
             blob_name = f"{blob_prefix}/xz/{y:03d}.png"
             blob_client = container_client.get_blob_client(blob_name)
-            blob_client.upload_blob(img_byte_arr.read(), overwrite=True)
+            upload_tasks.append(blob_client.upload_blob(png_bytes, overwrite=True))
+            
+            if len(upload_tasks) >= batch_size:
+                await upload_batch(upload_tasks)
+        await upload_batch(upload_tasks)
 
         logger.info("Completed XZ slices for %s", modality)
 
-        # Save YZ slices
+        # Process and Upload YZ slices
+        def extract_yz_slice(x_idx):
+            rgba_yz = np.stack([rgba_stack[z, :, x_idx, :] for z in range(Z)], axis=0)
+            alpha_yz = np.stack([alpha_stack[z, :, x_idx] for z in range(Z)], axis=0) if alpha_stack is not None else None
+            return rgba_yz, alpha_yz
+
         for x in range(X):
-            if CANCEL_FLAGS.get(dataset_id) or CANCEL_FLAGS.get(modality) or CANCEL_FLAGS.get("__" + dataset_id):
+            if await is_cancelled(dataset_id, modality):
                 raise Exception("Cancelled")
                 
-            if x % 100 == 0:  # Log progress every 100 slices
+            if x % 100 == 0:
                 logger.info("Processing %s YZ slice %d/%d", modality, x + 1, X)
                 
-            rgba_yz = np.stack([rgba_stack[z, :, x, :] for z in range(Z)], axis=0)
-            alpha_yz = np.stack([alpha_stack[z, :, x] for z in range(Z)], axis=0) if alpha_stack is not None else None
-            img = Image.fromarray(apply_alpha_mask(rgba_yz, alpha_yz))
-            img_byte_arr = BytesIO()
-            img.save(img_byte_arr, format="PNG")
-            img_byte_arr.seek(0)
+            rgba_yz, alpha_yz = await asyncio.to_thread(extract_yz_slice, x)
+            png_bytes = await asyncio.to_thread(generate_png_bytes, rgba_yz, alpha_yz)
+            
             blob_name = f"{blob_prefix}/yz/{x:03d}.png"
             blob_client = container_client.get_blob_client(blob_name)
-            blob_client.upload_blob(img_byte_arr.read(), overwrite=True)
+            upload_tasks.append(blob_client.upload_blob(png_bytes, overwrite=True))
+            
+            if len(upload_tasks) >= batch_size:
+                await upload_batch(upload_tasks)
+        await upload_batch(upload_tasks)
 
         logger.info("Completed YZ slices for %s", modality)
 
@@ -334,8 +393,9 @@ async def cancel_upload(request: Request, x_internal_secret: Optional[str] = Hea
     upload_id = body.get("uploadId")
     if not upload_id:
         raise HTTPException(status_code=400, detail="uploadId is required")
-    # Mark cancel flag; process loop periodically checks this
-    CANCEL_FLAGS[upload_id] = True
+    # Mark cancel flag in Redis with a 24-hour expiration
+    if redis_client:
+        await redis_client.setex(f"cancel:{upload_id}", 86400, "1")
     return {"ok": True}
 
 @app.get("/health")
