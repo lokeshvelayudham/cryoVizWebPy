@@ -375,7 +375,17 @@ async def process_dataset(
 ):
     global NEXT_BASE_URL
     if nextBaseUrl:
-        NEXT_BASE_URL = nextBaseUrl
+        import urllib.parse
+        import re
+        hostname = urllib.parse.urlparse(nextBaseUrl).hostname or ""
+        
+        # 1. Ignore Azure internal container hostnames (e.g. 2f4a23b8661c)
+        # 2. Ignore localhost/127.0.0.1 if we are deployed in Hugging Face (SPACE_ID is set)
+        is_internal_azure = bool(re.match(r'^[a-f0-9]{12}$', hostname))
+        is_local_on_hf = bool(os.getenv("SPACE_ID") and hostname in ["localhost", "127.0.0.1"])
+        
+        if not is_internal_azure and not is_local_on_hf:
+            NEXT_BASE_URL = nextBaseUrl
 
     # Schedule background coroutine on current event loop and return immediately
     asyncio.create_task(
