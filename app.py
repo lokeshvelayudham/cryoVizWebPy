@@ -352,6 +352,11 @@ async def process_dataset_bg(
                 os.remove(alpha_temp_path)
 
 
+@app.get("/")
+async def root():
+    return {"status": "ok", "message": "CryoVizWeb Backend"}
+
+@app.post("/")
 @app.post("/process-dataset")
 async def process_dataset(
     name: str = Form(...),
