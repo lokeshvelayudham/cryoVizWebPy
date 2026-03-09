@@ -44,7 +44,6 @@ if not connection_string:
 blob_service_client = BlobServiceClient.from_connection_string(connection_string)
 storage_account_name = os.getenv("AZURE_STORAGE_ACCOUNT", "bivlargefiles")
 container_name = os.getenv("AZURE_CONTAINER", "cryovizweb")
-AZURE_CDN_URL = os.getenv("AZURE_CDN_URL", "https://cryovizweb-cdn-gce9eaa9cwd2h4hb.z03.azurefd.net")
 
 INTERNAL_API_SECRET = os.getenv("INTERNAL_API_SECRET")
 NEXT_BASE_URL = os.getenv("NEXT_BASE_URL", "https://jolly-sky-05d96830f.6.azurestaticapps.net")
@@ -236,7 +235,7 @@ async def process_tiff_stack_from_file(tiff_path: str, alpha_file_path: Optional
 
         logger.info("Completed YZ slices for %s", modality)
 
-        blob_url = f"{AZURE_CDN_URL}/{container_name}/{blob_prefix}"
+        blob_url = f"https://{storage_account_name}.blob.core.windows.net/{container_name}/{blob_prefix}"
         logger.info("Successfully processed %s - generated %d PNG files", modality, Z + Y + X)
         return blob_url, Z, Y, X
 
